@@ -222,6 +222,12 @@ impl Tap {
         self.s_ndrv_fd.set_nonblocking(nonblocking)?;
         Ok(())
     }
+    /// Returns the descriptor to poll for write readiness: the AF_NDRV
+    /// socket that frames are written to.
+    ///
+    /// The BPF descriptor is only pollable for reads; polling it for
+    /// `POLLOUT` fails with `POLLNVAL`, so writability must be observed on the
+    /// socket that `send` actually writes to.
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     #[inline]
     pub(crate) fn writable_fd(&self) -> RawFd {

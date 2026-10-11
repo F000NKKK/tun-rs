@@ -53,6 +53,15 @@ impl NonBlockingDevice {
     pub fn wait_readable(&self, cancel_event: Option<libc::c_int>) -> io::Result<()> {
         self.wait(libc::POLLIN, cancel_event)
     }
+    /// Blocks until the device is ready for `device_events`, the shutdown
+    /// event fires, or `cancel_event` becomes readable.
+    ///
+    /// Writability is polled on `writable_fd`; for a TAP that is the AF_NDRV
+    /// socket, because the BPF descriptor only
+    /// supports read readiness and reports `POLLNVAL` for `POLLOUT`. TAP waits
+    /// also run the periodic detach probe, and a detached interface is
+    /// reported as ready so the next read or write surfaces the kernel's
+    /// `ENXIO`. Shutdown yields `UnexpectedEof`.
     fn wait(
         &self,
         device_events: libc::c_short,
@@ -500,6 +509,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// Creates an event pipe that stays idle until `wake` is called.
     fn idle_pipe() -> EventFd {
         EventFd::new().unwrap()
     }
@@ -559,6 +569,7 @@ mod tests {
         assert_eq!(probes, 3);
     }
 
+    /// A ready descriptor is returned before any probe runs.
     #[test]
     fn readiness_wins_over_probe() {
         let pipe = idle_pipe();

@@ -47,6 +47,7 @@ impl DeviceImpl {
             associate_route: AtomicBool::new(true),
         })
     }
+    /// Descriptor to poll for write readiness. See `TunTap::writable_fd`.
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     #[inline]
     pub(crate) fn writable_fd(&self) -> std::os::fd::RawFd {

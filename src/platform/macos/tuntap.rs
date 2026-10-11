@@ -168,6 +168,9 @@ impl TunTap {
     pub(crate) fn needs_detach_probe(&self) -> bool {
         matches!(self, TunTap::Tap(_))
     }
+    /// Descriptor to poll for write readiness: the utun descriptor for TUN,
+    /// the AF_NDRV socket for TAP (the BPF descriptor cannot be polled for
+    /// writes).
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     #[inline]
     pub(crate) fn writable_fd(&self) -> RawFd {

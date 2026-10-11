@@ -50,6 +50,7 @@ const CLEANUP_BOUND: Duration = Duration::from_secs(10);
 static SERIAL: Mutex<()> = Mutex::new(());
 static NEXT_PAIR: AtomicU32 = AtomicU32::new(0);
 
+/// Serializes the tests; a poisoned lock from a failed test is ignored.
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -167,6 +168,7 @@ struct Pair {
 }
 
 impl Pair {
+    /// Reserves the next free pair name and removes any leftover interfaces.
     fn new() -> Self {
         let idx = NEXT_PAIR.fetch_add(1, Ordering::SeqCst);
         let base = 60 + 2 * idx;
@@ -179,6 +181,7 @@ impl Pair {
         pair
     }
 
+    /// Destroys both interfaces of the pair; safe to call repeatedly.
     fn destroy(&self) {
         destroy(&self.dev);
         destroy(&self.peer);
@@ -189,6 +192,7 @@ impl Pair {
         format!("10.90.{}.{host}", self.idx)
     }
 
+    /// Builder for an L2 device on `dev` with `peer` as the feth peer.
     fn builder(&self) -> DeviceBuilder {
         DeviceBuilder::new()
             .name(self.dev.clone())
@@ -196,6 +200,7 @@ impl Pair {
             .peer_feth(self.peer.clone())
     }
 
+    /// Creates the async TAP without an IP address.
     fn build(&self) -> Arc<AsyncDevice> {
         Arc::new(
             self.builder()
@@ -204,6 +209,7 @@ impl Pair {
         )
     }
 
+    /// Creates the async TAP with `addr(1)/24`, so it emits ARP traffic.
     fn build_with_ip(&self) -> Arc<AsyncDevice> {
         Arc::new(
             self.builder()
@@ -215,19 +221,23 @@ impl Pair {
 }
 
 impl Drop for Pair {
+    /// Destroys the interfaces so no test leaves a feth behind.
     fn drop(&mut self) {
         self.destroy();
     }
 }
 
+/// `true` for the code-less `fd error` the readiness wait used to return.
 fn is_fd_error(e: &io::Error) -> bool {
     e.raw_os_error().is_none() && e.to_string() == "fd error"
 }
 
+/// Asserts that `e` carries the kernel's `ENXIO` from a detached interface.
 fn assert_enxio(e: &io::Error, ctx: &str) {
     assert_eq!(e.raw_os_error(), Some(libc::ENXIO), "{ctx}: {e:?}");
 }
 
+/// Asserts that `e` is a real OS error: not a timeout and not `fd error`.
 fn assert_os_error(e: &io::Error, ctx: &str) {
     assert!(
         e.raw_os_error().is_some() && e.kind() != io::ErrorKind::TimedOut && !is_fd_error(e),
@@ -246,6 +256,7 @@ fn recv_until_err(dev: &AsyncDevice) -> io::Error {
     }
 }
 
+/// Starts a thread that receives until the first error and reports it.
 fn spawn_recv(dev: &Arc<AsyncDevice>) -> Receiver<io::Error> {
     let (tx, rx) = mpsc::channel();
     let dev = dev.clone();
@@ -255,6 +266,7 @@ fn spawn_recv(dev: &Arc<AsyncDevice>) -> Receiver<io::Error> {
     rx
 }
 
+/// Waits up to `HANG_GUARD` for the reader's error; fails if it never wakes.
 fn expect_err(rx: &Receiver<io::Error>, ctx: &str) -> io::Error {
     match rx.recv_timeout(HANG_GUARD) {
         Ok(e) => e,
@@ -287,6 +299,7 @@ fn test_frame() -> Vec<u8> {
     frame
 }
 
+/// User plus system CPU time consumed by this process so far.
 fn cpu_time() -> Duration {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
@@ -306,6 +319,7 @@ fn poke_neighbor(pair: &Pair) {
 // Detach wake-up
 // ---------------------------------------------------------------------------
 
+/// A recv parked in the readiness wait fails with `ENXIO` after the destroy.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn pending_recv_errors_after_feth_pair_destroyed() {
@@ -326,6 +340,7 @@ fn pending_recv_errors_after_feth_pair_destroyed() {
     });
 }
 
+/// A first recv issued after the destroy fails with `ENXIO` without hanging.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn recv_after_destroy_before_first_recv_errors_immediately() {
@@ -343,6 +358,7 @@ fn recv_after_destroy_before_first_recv_errors_immediately() {
     );
 }
 
+/// Every one of 16 concurrently parked recvs wakes with `ENXIO`.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn many_parked_recvs_all_wake() {
@@ -374,6 +390,7 @@ fn many_parked_recvs_all_wake() {
     });
 }
 
+/// `readable()` resolves after the destroy and `try_recv` then returns `ENXIO`.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn readable_then_try_recv_surfaces_the_error() {
@@ -404,6 +421,7 @@ fn readable_then_try_recv_surfaces_the_error() {
     });
 }
 
+/// The poll-based `poll_recv` API also wakes with `ENXIO` after the destroy.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn poll_recv_wakes_after_destroy() {
@@ -430,6 +448,8 @@ fn poll_recv_wakes_after_destroy() {
     });
 }
 
+/// Repeated recv and readable calls on a detached device keep failing with an
+/// OS error, finish promptly and do not burn CPU.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn recv_keeps_erroring_after_error_without_spinning() {
@@ -464,6 +484,8 @@ fn recv_keeps_erroring_after_error_without_spinning() {
     });
 }
 
+/// Cancelling parked recvs leaves the wait machinery intact for the next
+/// reader, which still wakes with `ENXIO`.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn dropped_parked_recv_does_not_break_the_next_wake() {
@@ -487,6 +509,7 @@ fn dropped_parked_recv_does_not_break_the_next_wake() {
     });
 }
 
+/// Frames queued before the destroy are drained, then recv ends in `ENXIO`.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn queued_frames_then_destroy_end_in_error() {
@@ -503,6 +526,8 @@ fn queued_frames_then_destroy_end_in_error() {
     });
 }
 
+/// `send` on a detached device fails with an OS error, and `writable()` never
+/// returns the code-less `fd error`.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn send_after_destroy_reports_an_os_error() {
@@ -527,6 +552,8 @@ fn send_after_destroy_reports_an_os_error() {
 // Healthy device
 // ---------------------------------------------------------------------------
 
+/// A live TAP idle across several probe intervals is not reported as
+/// detached and still receives frames afterwards.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn healthy_tap_keeps_receiving_across_the_probe_interval() {
@@ -583,6 +610,8 @@ fn healthy_tap_keeps_receiving_across_the_probe_interval() {
     );
 }
 
+/// `writable()` resolves on a live TAP (polled on the AF_NDRV socket) while a
+/// reader stays parked.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn writable_resolves_on_a_live_tap() {
@@ -609,6 +638,7 @@ fn writable_resolves_on_a_live_tap() {
     });
 }
 
+/// An idle parked recv on a live TAP uses little CPU and stays pending.
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn idle_recv_on_a_live_tap_does_not_spin() {
@@ -627,6 +657,7 @@ fn idle_recv_on_a_live_tap_does_not_spin() {
     });
 }
 
+/// An idle utun recv never errors: the detach probe applies to TAP only.
 #[ignore = "requires root and creates utun interfaces"]
 #[test]
 fn utun_idle_recv_is_not_woken_by_the_probe() {
