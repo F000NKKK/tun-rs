@@ -36,7 +36,7 @@ use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 /// Upper bound for any single wait; a regression must fail within this.
 const HANG_GUARD: Duration = Duration::from_secs(10);
 /// Generous bound for "woken after the feth pair was destroyed". The probe
-/// interval is a quarter of a second, so this only trips on a real hang.
+/// interval is half a second, so this only trips on a real hang.
 const WAKE_BOUND: Duration = Duration::from_secs(4);
 /// Idle time that spans several probe intervals.
 const PROBE_SPAN: Duration = Duration::from_millis(1500);

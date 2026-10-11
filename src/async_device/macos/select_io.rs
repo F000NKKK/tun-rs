@@ -6,6 +6,7 @@ use std::io::{IoSlice, IoSliceMut};
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -13,6 +14,9 @@ use std::time::Duration;
 pub(crate) struct NonBlockingDevice {
     device: DeviceImpl,
     shutdown_event: EventFd,
+    /// Set while one waiter runs the detach probe, so concurrent waiters
+    /// skip theirs and retry on their next idle timeout.
+    probing: AtomicBool,
 }
 impl NonBlockingDevice {
     pub(crate) fn new_dev(device: DeviceImpl) -> io::Result<Self> {
@@ -20,7 +24,18 @@ impl NonBlockingDevice {
         Ok(Self {
             device,
             shutdown_event: EventFd::new()?,
+            probing: AtomicBool::new(false),
         })
+    }
+
+    /// Runs the detach probe unless another waiter is already running it.
+    fn probe_detached(&self) -> bool {
+        if self.probing.swap(true, Ordering::Acquire) {
+            return false;
+        }
+        let detached = self.device.is_detached();
+        self.probing.store(false, Ordering::Release);
+        detached
     }
 
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -92,11 +107,9 @@ impl NonBlockingDevice {
             });
         }
         // A destroyed feth pair raises no poll event on XNU, so TAP waits use
-        // a finite timeout and probe whether the BPF fd is still attached.
+        // a finite timeout and probe whether the feth interface still exists.
         let result = if self.device.needs_detach_probe() {
-            poll_with_probe(&mut fds, DETACH_PROBE_INTERVAL, || {
-                self.device.is_detached()
-            })?
+            poll_with_probe(&mut fds, DETACH_PROBE_INTERVAL, || self.probe_detached())?
         } else {
             let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
             if result < 0 {
@@ -132,9 +145,10 @@ impl NonBlockingDevice {
     }
 }
 
-/// Interval between detach probes while a TAP wait is idle (about 4 wakeups
-/// per second, so idle waits never turn into a busy loop).
-const DETACH_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+/// Interval between detach probes while a TAP wait is idle (about 2 wakeups
+/// per second, so idle waits never turn into a busy loop and a detach is
+/// noticed well within a second).
+const DETACH_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Polls `fds` with a finite timeout, calling `is_detached` after every idle
 /// timeout. Returns the number of ready descriptors, or `0` when

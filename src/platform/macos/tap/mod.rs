@@ -75,6 +75,13 @@ pub struct Tap {
     s_ndrv_fd: Fd,
     peer_feth: Feth,
     dev_feth: Feth,
+    /// Name of the feth interface the BPF descriptor is bound to.
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    peer_cname: CString,
+    /// Interface index of `peer_cname` when the descriptor was bound (`0`
+    /// when it could not be determined).
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    peer_ifindex: u32,
     buffer: Mutex<VecDeque<BytesMut>>,
 }
 struct Feth {
@@ -193,11 +200,19 @@ impl Tap {
             if rs != 0 {
                 return Err(io::Error::last_os_error());
             }
+            #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+            let peer_cname = CString::new(peer_feth.name.as_bytes())?;
+            #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+            let peer_ifindex = libc::if_nametoindex(peer_cname.as_ptr());
             Ok(Self {
                 s_bpf_fd,
                 s_ndrv_fd,
                 dev_feth,
                 peer_feth,
+                #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+                peer_cname,
+                #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+                peer_ifindex,
                 buffer: Default::default(),
             })
         }
@@ -233,27 +248,24 @@ impl Tap {
     pub(crate) fn writable_fd(&self) -> RawFd {
         self.s_ndrv_fd.as_raw_fd()
     }
-    /// Returns `true` once the BPF descriptor is no longer attached to its
-    /// feth interface (for example after the feth pair was destroyed).
+    /// Returns `true` once the feth interface the BPF descriptor is bound to
+    /// no longer exists (for example after the feth pair was destroyed).
     ///
     /// XNU raises no poll event when the interface disappears, so async
-    /// waiters probe this periodically. `BIOCGETIF` fails with `EINVAL` or
-    /// `ENXIO` on a detached descriptor; any other outcome is treated as
-    /// "still attached" so transient errors never end a wait early.
+    /// waiters probe this periodically. The probe never touches the BPF
+    /// descriptor: it resolves the interface name with `if_nametoindex` and
+    /// compares the result with the index recorded when the descriptor was
+    /// bound. A missing interface (index `0`) or a different index (the name
+    /// was reused by a new interface) means detached. If no index could be
+    /// recorded the device is never reported as detached.
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     pub(crate) fn is_detached(&self) -> bool {
-        // SAFETY: `ifreq` is plain old data and zero is a valid bit pattern;
-        // BIOCGETIF writes at most `size_of::<ifreq>()` bytes into it.
-        let mut ifr: ifreq = unsafe { std::mem::zeroed() };
-        let rs = unsafe { libc::ioctl(self.s_bpf_fd.inner, libc::BIOCGETIF, &mut ifr) };
-        if rs == -1 {
-            matches!(
-                io::Error::last_os_error().raw_os_error(),
-                Some(libc::EINVAL) | Some(libc::ENXIO)
-            )
-        } else {
-            false
+        if self.peer_ifindex == 0 {
+            return false;
         }
+        // SAFETY: `peer_cname` is a valid NUL-terminated string.
+        let current = unsafe { libc::if_nametoindex(self.peer_cname.as_ptr()) };
+        current != self.peer_ifindex
     }
     #[inline]
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
