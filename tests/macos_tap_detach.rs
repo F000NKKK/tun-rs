@@ -22,7 +22,7 @@
 
 use futures::executor::block_on;
 use futures::FutureExt;
-use std::io::{self, Write};
+use std::io;
 use std::net::UdpSocket;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::process::{Command, Stdio};
@@ -43,7 +43,7 @@ const PROBE_SPAN: Duration = Duration::from_millis(1500);
 /// Deadline for a whole test body, setup and cleanup included.
 const TEST_DEADLINE: Duration = Duration::from_secs(45);
 /// Last resort: the process exits if a test (or its cleanup) stalls this long.
-const WATCHDOG: Duration = Duration::from_secs(120);
+const WATCHDOG: Duration = Duration::from_secs(90);
 /// Bound for one `ifconfig destroy`.
 const CLEANUP_BOUND: Duration = Duration::from_secs(10);
 
@@ -127,11 +127,14 @@ fn run(name: &'static str, body: impl FnOnce(Arc<Pair>) + Send + 'static) {
                 }
                 thread::sleep(Duration::from_millis(200));
             }
-            eprintln!("watchdog: {name} stalled past {WATCHDOG:?}; exiting");
-            let _ = io::stderr().flush();
-            // `_exit` skips exit handlers, which could themselves block on
-            // the stalled threads.
-            unsafe { libc::_exit(2) };
+            // Nothing here may take a lock or allocate: write straight to
+            // fd 2, then end the process without running exit handlers.
+            let msg = format!("watchdog: {name} stalled past {WATCHDOG:?}; killing\n");
+            unsafe {
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::kill(libc::getpid(), libc::SIGKILL);
+                libc::_exit(2);
+            }
         });
     }
     let _serial = serial();
