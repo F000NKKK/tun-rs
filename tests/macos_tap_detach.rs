@@ -9,7 +9,8 @@
 //!
 //! The tests drive the futures with a minimal executor and plain threads, so
 //! they run unchanged with either the `async_tokio` or the `async_io`
-//! feature. Every wait is behind a hang guard, so a regression fails fast
+//! feature. Every test body runs on a worker thread under a deadline, and every
+//! wait inside it has its own guard, so a regression fails in bounded time
 //! instead of stalling the job.
 //!
 //! Run with root on macOS:
@@ -23,8 +24,9 @@ use futures::executor::block_on;
 use futures::FutureExt;
 use std::io;
 use std::net::UdpSocket;
-use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -38,6 +40,12 @@ const HANG_GUARD: Duration = Duration::from_secs(10);
 const WAKE_BOUND: Duration = Duration::from_secs(4);
 /// Idle time that spans several probe intervals.
 const PROBE_SPAN: Duration = Duration::from_millis(1500);
+/// Deadline for a whole test body, setup and cleanup included.
+const TEST_DEADLINE: Duration = Duration::from_secs(45);
+/// Last resort: the process exits if a test (or its cleanup) stalls this long.
+const WATCHDOG: Duration = Duration::from_secs(120);
+/// Bound for one `ifconfig destroy`.
+const CLEANUP_BOUND: Duration = Duration::from_secs(10);
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static NEXT_PAIR: AtomicU32 = AtomicU32::new(0);
@@ -46,30 +54,121 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Runs `ifconfig <name> destroy`, killing it if the kernel stalls so that
+/// cleanup can never hang a test.
 fn destroy(name: &str) {
-    let _ = Command::new("ifconfig").args([name, "destroy"]).status();
+    let Ok(mut child) = Command::new("ifconfig")
+        .args([name, "destroy"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let end = Instant::now() + CLEANUP_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                eprintln!("ifconfig {name} destroy stalled; killing it");
+                let _ = child.kill();
+                return;
+            }
+            _ => return,
+        }
+    }
 }
 
-/// A uniquely named feth pair that is destroyed on every exit path. It also
-/// serializes the tests so CPU and timing measurements are not disturbed by
-/// neighbors.
+/// Prints the stacks of every thread of this process (best effort) so a hang
+/// shows where the threads are blocked.
+fn dump_threads(name: &str) {
+    let out = std::env::temp_dir().join(format!("tun_rs_sample_{}.txt", std::process::id()));
+    let Ok(mut child) = Command::new("sample")
+        .arg(std::process::id().to_string())
+        .arg("1")
+        .arg("-file")
+        .arg(&out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let end = Instant::now() + Duration::from_secs(20);
+    while matches!(child.try_wait(), Ok(None)) {
+        if Instant::now() >= end {
+            let _ = child.kill();
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if let Ok(text) = std::fs::read_to_string(&out) {
+        eprintln!("---- thread dump for {name} ----");
+        eprintln!("{}", &text[..text.len().min(60_000)]);
+    }
+}
+
+/// Runs a test body on a worker thread with a deadline. On timeout it dumps
+/// the thread stacks, destroys the feth pair and fails from the test thread;
+/// a watchdog ends the process if even that stalls. Tests are serialized so
+/// CPU and timing measurements are not disturbed by neighbors.
+fn run(name: &'static str, body: impl FnOnce(Arc<Pair>) + Send + 'static) {
+    let _serial = serial();
+    let pair = Arc::new(Pair::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    {
+        let finished = finished.clone();
+        thread::spawn(move || {
+            let end = Instant::now() + WATCHDOG;
+            while Instant::now() < end {
+                if finished.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            eprintln!("watchdog: {name} stalled past {WATCHDOG:?}; exiting");
+            std::process::exit(2);
+        });
+    }
+    let (tx, rx) = mpsc::channel();
+    {
+        let pair = pair.clone();
+        thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| body(pair)));
+                let _ = tx.send(outcome);
+            })
+            .expect("spawn test worker");
+    }
+    let outcome = rx.recv_timeout(TEST_DEADLINE);
+    if outcome.is_err() {
+        dump_threads(name);
+    }
+    pair.destroy();
+    finished.store(true, Ordering::SeqCst);
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(payload)) => resume_unwind(payload),
+        Err(_) => panic!("{name}: did not finish within {TEST_DEADLINE:?}"),
+    }
+}
+
+/// A uniquely named feth pair, destroyed on every exit path.
 struct Pair {
     idx: u32,
     dev: String,
     peer: String,
-    _serial: MutexGuard<'static, ()>,
 }
 
 impl Pair {
     fn new() -> Self {
-        let guard = serial();
         let idx = NEXT_PAIR.fetch_add(1, Ordering::SeqCst);
         let base = 60 + 2 * idx;
         let pair = Pair {
             idx,
             dev: format!("feth{base}"),
             peer: format!("feth{}", base + 1),
-            _serial: guard,
         };
         pair.destroy();
         pair
@@ -202,190 +301,218 @@ fn poke_neighbor(pair: &Pair) {
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn pending_recv_errors_after_feth_pair_destroyed() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    let rx = spawn_recv(&dev);
-    // Let the reader park in the readiness wait, then destroy the pair.
-    thread::sleep(Duration::from_millis(500));
-    pair.destroy();
-    let start = Instant::now();
-    let err = expect_err(&rx, "destroy while recv parked");
-    assert!(
-        start.elapsed() < WAKE_BOUND,
-        "wake took {:?}",
-        start.elapsed()
-    );
-    assert_enxio(&err, "destroy while recv parked");
+    run("pending_recv_errors_after_feth_pair_destroyed", |pair| {
+        let dev = pair.build();
+        let rx = spawn_recv(&dev);
+        // Let the reader park in the readiness wait, then destroy the pair.
+        thread::sleep(Duration::from_millis(500));
+        pair.destroy();
+        let start = Instant::now();
+        let err = expect_err(&rx, "destroy while recv parked");
+        assert!(
+            start.elapsed() < WAKE_BOUND,
+            "wake took {:?}",
+            start.elapsed()
+        );
+        assert_enxio(&err, "destroy while recv parked");
+    });
 }
 
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn recv_after_destroy_before_first_recv_errors_immediately() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    pair.destroy();
-    let start = Instant::now();
-    let rx = spawn_recv(&dev);
-    let err = expect_err(&rx, "destroy before first recv");
-    assert!(start.elapsed() < WAKE_BOUND, "took {:?}", start.elapsed());
-    assert_enxio(&err, "destroy before first recv");
-}
-
-#[ignore = "requires root and creates feth interfaces"]
-#[test]
-fn many_parked_recvs_all_wake() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    let readers: Vec<_> = (0..16).map(|_| spawn_recv(&dev)).collect();
-    thread::sleep(Duration::from_millis(500));
-    pair.destroy();
-    for (i, rx) in readers.iter().enumerate() {
-        let err = expect_err(rx, &format!("parked reader {i}"));
-        assert_enxio(&err, &format!("parked reader {i}"));
-    }
-}
-
-#[ignore = "requires root and creates feth interfaces"]
-#[test]
-fn readable_then_try_recv_surfaces_the_error() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    let (tx, rx) = mpsc::channel();
-    {
-        let dev = dev.clone();
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 9216];
-            let err = loop {
-                if let Err(e) = block_on(dev.readable()) {
-                    break e;
-                }
-                match dev.try_recv(&mut buf) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => break e,
-                }
-            };
-            let _ = tx.send(err);
-        });
-    }
-    thread::sleep(Duration::from_millis(500));
-    pair.destroy();
-    let err = expect_err(&rx, "readable + try_recv");
-    assert_enxio(&err, "readable + try_recv");
-}
-
-#[ignore = "requires root and creates feth interfaces"]
-#[test]
-fn poll_recv_wakes_after_destroy() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    let (tx, rx) = mpsc::channel();
-    {
-        let dev = dev.clone();
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 9216];
-            let err = loop {
-                match block_on(futures::future::poll_fn(|cx| dev.poll_recv(cx, &mut buf))) {
-                    Ok(_) => {}
-                    Err(e) => break e,
-                }
-            };
-            let _ = tx.send(err);
-        });
-    }
-    thread::sleep(Duration::from_millis(500));
-    pair.destroy();
-    let err = expect_err(&rx, "poll_recv");
-    assert_enxio(&err, "poll_recv");
-}
-
-#[ignore = "requires root and creates feth interfaces"]
-#[test]
-fn recv_keeps_erroring_after_error_without_spinning() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    let rx = spawn_recv(&dev);
-    thread::sleep(Duration::from_millis(300));
-    pair.destroy();
-    assert_enxio(&expect_err(&rx, "first error"), "first error");
-
-    let started = cpu_time();
-    let wall = Instant::now();
-    let dev2 = dev.clone();
-    guarded("repeated recv/readable after error", move || {
-        let mut buf = vec![0u8; 9216];
-        for i in 0..100 {
-            let err = block_on(dev2.recv(&mut buf)).expect_err("recv must keep failing");
-            assert_os_error(&err, &format!("repeat {i}"));
-            // readable() either reports the error or resolves so the next
-            // read can; it must never park forever.
-            if let Err(e) = block_on(dev2.readable()) {
-                assert_os_error(&e, &format!("readable repeat {i}"));
-            }
-        }
-    });
-    assert!(wall.elapsed() < HANG_GUARD);
-    assert!(
-        cpu_time() - started < Duration::from_secs(5),
-        "erroring loop burned {:?} of CPU",
-        cpu_time() - started
+    run(
+        "recv_after_destroy_before_first_recv_errors_immediately",
+        |pair| {
+            let dev = pair.build();
+            pair.destroy();
+            let start = Instant::now();
+            let rx = spawn_recv(&dev);
+            let err = expect_err(&rx, "destroy before first recv");
+            assert!(start.elapsed() < WAKE_BOUND, "took {:?}", start.elapsed());
+            assert_enxio(&err, "destroy before first recv");
+        },
     );
 }
 
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
-fn dropped_parked_recv_does_not_break_the_next_wake() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    let mut buf = vec![0u8; 9216];
-    for _ in 0..20 {
-        // Poll a recv until it parks (a stray frame may complete it first),
-        // then drop it to exercise the cancel path.
-        for _ in 0..20 {
-            if dev.recv(&mut buf).now_or_never().is_none() {
-                break;
+fn many_parked_recvs_all_wake() {
+    run("many_parked_recvs_all_wake", |pair| {
+        let dev = pair.build();
+        let readers: Vec<_> = (0..16).map(|_| spawn_recv(&dev)).collect();
+        thread::sleep(Duration::from_millis(500));
+        pair.destroy();
+        // One shared deadline; report how many readers woke on failure.
+        let deadline = Instant::now() + HANG_GUARD;
+        let mut woke = 0;
+        let mut errors = Vec::new();
+        for rx in &readers {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Ok(e) = rx.recv_timeout(left) {
+                woke += 1;
+                errors.push(e);
             }
         }
-    }
-    let rx = spawn_recv(&dev);
-    thread::sleep(Duration::from_millis(500));
-    pair.destroy();
-    let err = expect_err(&rx, "recv after cancellations");
-    assert_enxio(&err, "recv after cancellations");
+        assert_eq!(
+            woke,
+            readers.len(),
+            "only {woke} of {} parked readers woke after the destroy",
+            readers.len()
+        );
+        for (i, e) in errors.iter().enumerate() {
+            assert_enxio(e, &format!("parked reader {i}"));
+        }
+    });
+}
+
+#[ignore = "requires root and creates feth interfaces"]
+#[test]
+fn readable_then_try_recv_surfaces_the_error() {
+    run("readable_then_try_recv_surfaces_the_error", |pair| {
+        let dev = pair.build();
+        let (tx, rx) = mpsc::channel();
+        {
+            let dev = dev.clone();
+            thread::spawn(move || {
+                let mut buf = vec![0u8; 9216];
+                let err = loop {
+                    if let Err(e) = block_on(dev.readable()) {
+                        break e;
+                    }
+                    match dev.try_recv(&mut buf) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => break e,
+                    }
+                };
+                let _ = tx.send(err);
+            });
+        }
+        thread::sleep(Duration::from_millis(500));
+        pair.destroy();
+        let err = expect_err(&rx, "readable + try_recv");
+        assert_enxio(&err, "readable + try_recv");
+    });
+}
+
+#[ignore = "requires root and creates feth interfaces"]
+#[test]
+fn poll_recv_wakes_after_destroy() {
+    run("poll_recv_wakes_after_destroy", |pair| {
+        let dev = pair.build();
+        let (tx, rx) = mpsc::channel();
+        {
+            let dev = dev.clone();
+            thread::spawn(move || {
+                let mut buf = vec![0u8; 9216];
+                let err = loop {
+                    match block_on(futures::future::poll_fn(|cx| dev.poll_recv(cx, &mut buf))) {
+                        Ok(_) => {}
+                        Err(e) => break e,
+                    }
+                };
+                let _ = tx.send(err);
+            });
+        }
+        thread::sleep(Duration::from_millis(500));
+        pair.destroy();
+        let err = expect_err(&rx, "poll_recv");
+        assert_enxio(&err, "poll_recv");
+    });
+}
+
+#[ignore = "requires root and creates feth interfaces"]
+#[test]
+fn recv_keeps_erroring_after_error_without_spinning() {
+    run("recv_keeps_erroring_after_error_without_spinning", |pair| {
+        let dev = pair.build();
+        let rx = spawn_recv(&dev);
+        thread::sleep(Duration::from_millis(300));
+        pair.destroy();
+        assert_enxio(&expect_err(&rx, "first error"), "first error");
+
+        let started = cpu_time();
+        let wall = Instant::now();
+        let dev2 = dev.clone();
+        guarded("repeated recv/readable after error", move || {
+            let mut buf = vec![0u8; 9216];
+            for i in 0..100 {
+                let err = block_on(dev2.recv(&mut buf)).expect_err("recv must keep failing");
+                assert_os_error(&err, &format!("repeat {i}"));
+                // readable() either reports the error or resolves so the next
+                // read can; it must never park forever.
+                if let Err(e) = block_on(dev2.readable()) {
+                    assert_os_error(&e, &format!("readable repeat {i}"));
+                }
+            }
+        });
+        assert!(wall.elapsed() < HANG_GUARD);
+        assert!(
+            cpu_time() - started < Duration::from_secs(5),
+            "erroring loop burned {:?} of CPU",
+            cpu_time() - started
+        );
+    });
+}
+
+#[ignore = "requires root and creates feth interfaces"]
+#[test]
+fn dropped_parked_recv_does_not_break_the_next_wake() {
+    run("dropped_parked_recv_does_not_break_the_next_wake", |pair| {
+        let dev = pair.build();
+        let mut buf = vec![0u8; 9216];
+        for _ in 0..20 {
+            // Poll a recv until it parks (a stray frame may complete it first),
+            // then drop it to exercise the cancel path.
+            for _ in 0..20 {
+                if dev.recv(&mut buf).now_or_never().is_none() {
+                    break;
+                }
+            }
+        }
+        let rx = spawn_recv(&dev);
+        thread::sleep(Duration::from_millis(500));
+        pair.destroy();
+        let err = expect_err(&rx, "recv after cancellations");
+        assert_enxio(&err, "recv after cancellations");
+    });
 }
 
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn queued_frames_then_destroy_end_in_error() {
-    let pair = Pair::new();
-    let dev = pair.build_with_ip();
-    for _ in 0..5 {
-        poke_neighbor(&pair);
-        thread::sleep(Duration::from_millis(100));
-    }
-    pair.destroy();
-    let rx = spawn_recv(&dev);
-    let err = expect_err(&rx, "queued frames then destroy");
-    assert_enxio(&err, "queued frames then destroy");
+    run("queued_frames_then_destroy_end_in_error", |pair| {
+        let dev = pair.build_with_ip();
+        for _ in 0..5 {
+            poke_neighbor(&pair);
+            thread::sleep(Duration::from_millis(100));
+        }
+        pair.destroy();
+        let rx = spawn_recv(&dev);
+        let err = expect_err(&rx, "queued frames then destroy");
+        assert_enxio(&err, "queued frames then destroy");
+    });
 }
 
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn send_after_destroy_reports_an_os_error() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    pair.destroy();
-    let frame = test_frame();
-    let dev2 = dev.clone();
-    let result = guarded("send after destroy", move || block_on(dev2.send(&frame)));
-    let err = result.expect_err("send on a destroyed feth must fail");
-    assert_os_error(&err, "send after destroy");
+    run("send_after_destroy_reports_an_os_error", |pair| {
+        let dev = pair.build();
+        pair.destroy();
+        let frame = test_frame();
+        let dev2 = dev.clone();
+        let result = guarded("send after destroy", move || block_on(dev2.send(&frame)));
+        let err = result.expect_err("send on a destroyed feth must fail");
+        assert_os_error(&err, "send after destroy");
 
-    let dev3 = dev.clone();
-    let writable = guarded("writable after destroy", move || block_on(dev3.writable()));
-    if let Err(e) = writable {
-        assert!(!is_fd_error(&e), "writable after destroy: {e:?}");
-    }
+        let dev3 = dev.clone();
+        let writable = guarded("writable after destroy", move || block_on(dev3.writable()));
+        if let Err(e) = writable {
+            assert!(!is_fd_error(&e), "writable after destroy: {e:?}");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -395,126 +522,145 @@ fn send_after_destroy_reports_an_os_error() {
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn healthy_tap_keeps_receiving_across_the_probe_interval() {
-    let pair = Pair::new();
-    let dev = pair.build_with_ip();
-    let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>();
-    {
-        let dev = dev.clone();
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 9216];
-            loop {
-                match block_on(dev.recv(&mut buf)) {
-                    Ok(n) => {
-                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
-                            return;
+    run(
+        "healthy_tap_keeps_receiving_across_the_probe_interval",
+        |pair| {
+            let dev = pair.build_with_ip();
+            let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>();
+            {
+                let dev = dev.clone();
+                thread::spawn(move || {
+                    let mut buf = vec![0u8; 9216];
+                    loop {
+                        match block_on(dev.recv(&mut buf)) {
+                            Ok(n) => {
+                                if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                return;
+                            }
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
+                });
+            }
+            // Idle across several probe intervals: the probe must not report a live
+            // device as detached.
+            thread::sleep(PROBE_SPAN);
+            let target = pair.addr(2).parse::<std::net::Ipv4Addr>().unwrap().octets();
+            let deadline = Instant::now() + HANG_GUARD;
+            let mut saw_arp = false;
+            while !saw_arp && Instant::now() < deadline {
+                poke_neighbor(&pair);
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(Ok(frame)) => {
+                            if frame.len() >= 42
+                                && frame[12..14] == [0x08, 0x06]
+                                && frame[38..42] == target
+                            {
+                                saw_arp = true;
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => panic!("live TAP reported an error: {e:?}"),
+                        Err(_) => break,
                     }
                 }
             }
-        });
-    }
-    // Idle across several probe intervals: the probe must not report a live
-    // device as detached.
-    thread::sleep(PROBE_SPAN);
-    let target = pair.addr(2).parse::<std::net::Ipv4Addr>().unwrap().octets();
-    let deadline = Instant::now() + HANG_GUARD;
-    let mut saw_arp = false;
-    while !saw_arp && Instant::now() < deadline {
-        poke_neighbor(&pair);
-        loop {
-            match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(Ok(frame)) => {
-                    if frame.len() >= 42 && frame[12..14] == [0x08, 0x06] && frame[38..42] == target
-                    {
-                        saw_arp = true;
-                        break;
-                    }
-                }
-                Ok(Err(e)) => panic!("live TAP reported an error: {e:?}"),
-                Err(_) => break,
-            }
-        }
-    }
-    assert!(saw_arp, "no ARP request for {target:?} reached the reader");
+            assert!(saw_arp, "no ARP request for {target:?} reached the reader");
+        },
+    );
 }
 
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn writable_resolves_on_a_live_tap() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    // A parked reader must not interfere with writability waits.
-    let reader = spawn_recv(&dev);
-    thread::sleep(Duration::from_millis(300));
-    let dev2 = dev.clone();
-    guarded("writable on a live TAP", move || {
-        for i in 0..10 {
-            match block_on(dev2.writable()) {
-                Ok(()) => {}
-                Err(e) => panic!("writable() #{i} failed on a live TAP: {e:?}"),
+    run("writable_resolves_on_a_live_tap", |pair| {
+        let dev = pair.build();
+        // A parked reader must not interfere with writability waits.
+        let reader = spawn_recv(&dev);
+        thread::sleep(Duration::from_millis(300));
+        let dev2 = dev.clone();
+        guarded("writable on a live TAP", move || {
+            for i in 0..10 {
+                match block_on(dev2.writable()) {
+                    Ok(()) => {}
+                    Err(e) => panic!("writable() #{i} failed on a live TAP: {e:?}"),
+                }
             }
-        }
-        let n = block_on(dev2.send(&test_frame())).expect("send on a live TAP");
-        assert!(n > 0);
+            let n = block_on(dev2.send(&test_frame())).expect("send on a live TAP");
+            assert!(n > 0);
+        });
+        assert!(
+            reader.try_recv().is_err(),
+            "reader must still be parked on a live TAP"
+        );
     });
-    assert!(
-        reader.try_recv().is_err(),
-        "reader must still be parked on a live TAP"
-    );
 }
 
 #[ignore = "requires root and creates feth interfaces"]
 #[test]
 fn idle_recv_on_a_live_tap_does_not_spin() {
-    let pair = Pair::new();
-    let dev = pair.build();
-    let reader = spawn_recv(&dev);
-    thread::sleep(Duration::from_millis(300));
-    let before = cpu_time();
-    thread::sleep(Duration::from_secs(2));
-    let used = cpu_time() - before;
-    assert!(
-        used < Duration::from_secs(1),
-        "idle TAP wait used {used:?} CPU in 2 s (busy loop?)"
-    );
-    assert!(reader.try_recv().is_err(), "idle reader must stay parked");
+    run("idle_recv_on_a_live_tap_does_not_spin", |pair| {
+        let dev = pair.build();
+        let reader = spawn_recv(&dev);
+        thread::sleep(Duration::from_millis(300));
+        let before = cpu_time();
+        thread::sleep(Duration::from_secs(2));
+        let used = cpu_time() - before;
+        assert!(
+            used < Duration::from_secs(1),
+            "idle TAP wait used {used:?} CPU in 2 s (busy loop?)"
+        );
+        assert!(reader.try_recv().is_err(), "idle reader must stay parked");
+    });
 }
 
 #[ignore = "requires root and creates utun interfaces"]
 #[test]
 fn utun_idle_recv_is_not_woken_by_the_probe() {
-    let _serial = serial();
-    let dev = Arc::new(
-        DeviceBuilder::new()
-            .ipv4("10.91.0.1", 24, None)
-            .build_async()
-            .expect("create async TUN (needs root)"),
-    );
-    let (tx, rx) = mpsc::channel::<io::Result<usize>>();
-    {
-        let dev = dev.clone();
-        thread::spawn(move || {
-            let mut buf = vec![0u8; 9216];
-            loop {
-                let r = block_on(dev.recv(&mut buf));
-                let stop = r.is_err();
-                if tx.send(r).is_err() || stop {
-                    return;
+    run("utun_idle_recv_is_not_woken_by_the_probe", |_pair| {
+        // The tokio backend registers the utun fd with the reactor on
+        // creation, which needs a runtime context.
+        #[cfg(feature = "async_tokio")]
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        #[cfg(feature = "async_tokio")]
+        let _entered = runtime.enter();
+        let dev = Arc::new(
+            DeviceBuilder::new()
+                .ipv4("10.91.0.1", 24, None)
+                .build_async()
+                .expect("create async TUN (needs root)"),
+        );
+        let (tx, rx) = mpsc::channel::<io::Result<usize>>();
+        {
+            let dev = dev.clone();
+            thread::spawn(move || {
+                let mut buf = vec![0u8; 9216];
+                loop {
+                    let r = block_on(dev.recv(&mut buf));
+                    let stop = r.is_err();
+                    if tx.send(r).is_err() || stop {
+                        return;
+                    }
                 }
-            }
-        });
-    }
-    // Stray packets are fine; an error from an idle utun is not.
-    let end = Instant::now() + PROBE_SPAN;
-    while let Some(left) = end.checked_duration_since(Instant::now()) {
-        match rx.recv_timeout(left) {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => panic!("idle utun recv failed: {e:?}"),
-            Err(_) => break,
+            });
         }
-    }
+        // Stray packets are fine; an error from an idle utun is not.
+        let end = Instant::now() + PROBE_SPAN;
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("idle utun recv failed: {e:?}"),
+                Err(_) => break,
+            }
+        }
+    });
 }
