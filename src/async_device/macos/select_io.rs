@@ -11,14 +11,24 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+/// A device switched to non-blocking mode, with blocking readiness waits that
+/// can be interrupted by a shutdown event.
 pub(crate) struct NonBlockingDevice {
+    /// The underlying device.
     device: DeviceImpl,
+    /// Fired on drop to wake every parked waiter.
     shutdown_event: EventFd,
     /// Set while one waiter runs the detach probe, so concurrent waiters
     /// skip theirs and retry on their next idle timeout.
     probing: AtomicBool,
 }
 impl NonBlockingDevice {
+    /// Wraps `device`, switching it to non-blocking mode.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the descriptor cannot be made non-blocking or the shutdown
+    /// event cannot be created.
     pub(crate) fn new_dev(device: DeviceImpl) -> io::Result<Self> {
         device.set_nonblocking(true)?;
         Ok(Self {
@@ -286,6 +296,13 @@ impl AsyncDevice {
     }
 }
 impl AsyncDevice {
+    /// Waits until the device is readable.
+    ///
+    /// For a TAP device the wait also resolves once the underlying `feth`
+    /// pair has been destroyed, so the next read fails with `ENXIO`. That
+    /// wake-up is verified for one and two concurrently parked readers. With
+    /// four or more parked readers on XNU the readers were not woken in CI and
+    /// the process could hang at exit in the kernel, so do not rely on it.
     pub async fn readable(&self) -> io::Result<()> {
         let device = self.inner.clone();
         let mut canceller = Canceller::new_cancelable()?;
@@ -518,6 +535,7 @@ impl Drop for CancelWaitGuard<'_> {
     }
 }
 
+/// Unit tests for the detach-probing poll loop.
 #[cfg(test)]
 mod tests {
     use super::*;

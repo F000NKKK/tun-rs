@@ -85,6 +85,7 @@ jobs:
           cargo build --verbose --examples --tests --features async_tokio
       - name: macOS unit tests (TAP detach probe)
         if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 5
         run: |
           cargo test --lib --features async_tokio select_io
           cargo test --lib --features async_io select_io

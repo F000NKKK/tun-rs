@@ -70,10 +70,27 @@ pub(crate) fn run_command(command: &str, args: &[&str]) -> io::Result<()> {
     Ok(())
 }
 
+/// A macOS TAP device: a `feth` interface pair, with frames read through a BPF
+/// descriptor bound to the peer and written through an `AF_NDRV` socket.
+///
+/// # Destroyed interface
+///
+/// XNU raises no poll event on the BPF descriptor when the `feth` pair is
+/// destroyed. With the `async_tokio` or `async_io` feature, async waits
+/// therefore probe the interface periodically (about twice per second), and
+/// parked readers then fail with `ENXIO`. This wake-up is verified for one and
+/// two concurrently parked readers. With four or more parked readers on XNU
+/// the readers were not woken in CI and the process could hang at exit in the
+/// kernel, so do not rely on waking many parked readers by destroying the
+/// interface; stop the readers first.
 pub struct Tap {
+    /// BPF descriptor that frames are read from.
     s_bpf_fd: Fd,
+    /// AF_NDRV socket that frames are written to.
     s_ndrv_fd: Fd,
+    /// Peer `feth` interface the BPF descriptor is bound to.
     peer_feth: Feth,
+    /// `feth` interface that carries the device's own name and address.
     dev_feth: Feth,
     /// Name of the feth interface the BPF descriptor is bound to.
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
@@ -82,6 +99,7 @@ pub struct Tap {
     /// when it could not be determined).
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     peer_ifindex: u32,
+    /// Frames already read from BPF but not yet returned to the caller.
     buffer: Mutex<VecDeque<BytesMut>>,
 }
 struct Feth {
@@ -104,6 +122,13 @@ impl IntoRawFd for Tap {
     }
 }
 impl Tap {
+    /// Creates (or reuses) the `feth` pair described by `config`, binds a BPF
+    /// descriptor to the peer and opens the `AF_NDRV` socket used for writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error of the failing socket, `ioctl` or `feth` creation
+    /// call. Creating the interfaces requires root.
     pub fn new(config: &DeviceConfig) -> io::Result<Tap> {
         unsafe {
             let s_ndrv_fd = libc::socket(libc::AF_NDRV, libc::SOCK_RAW, 0);
@@ -203,6 +228,8 @@ impl Tap {
             #[cfg(any(feature = "async_io", feature = "async_tokio"))]
             let peer_cname = CString::new(peer_feth.name.as_bytes())?;
             #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+            // SAFETY: `peer_cname` is a valid NUL-terminated string that
+            // outlives the call; `if_nametoindex` only reads it.
             let peer_ifindex = libc::if_nametoindex(peer_cname.as_ptr());
             Ok(Self {
                 s_bpf_fd,

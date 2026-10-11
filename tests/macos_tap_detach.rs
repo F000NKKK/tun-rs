@@ -47,7 +47,9 @@ const WATCHDOG: Duration = Duration::from_secs(90);
 /// Bound for one `ifconfig destroy`.
 const CLEANUP_BOUND: Duration = Duration::from_secs(10);
 
+/// Held by every test so they run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
+/// Index of the next feth pair, keeping interface names unique per test.
 static NEXT_PAIR: AtomicU32 = AtomicU32::new(0);
 
 /// Serializes the tests; a poisoned lock from a failed test is ignored.
@@ -165,8 +167,11 @@ fn run(name: &'static str, body: impl FnOnce(Arc<Pair>) + Send + 'static) {
 
 /// A uniquely named feth pair, destroyed on every exit path.
 struct Pair {
+    /// Unique pair index, also used to derive addresses.
     idx: u32,
+    /// Name of the TAP-side interface.
     dev: String,
+    /// Name of the peer interface the BPF descriptor binds to.
     peer: String,
     /// Set once the pair was destroyed, so the kernel is never asked to
     /// destroy an interface that is still detaching from an earlier request.
