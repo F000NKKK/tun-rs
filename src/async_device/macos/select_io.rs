@@ -223,7 +223,6 @@ pub(crate) fn diag(args: std::fmt::Arguments<'_>) {
             .open(path)
         {
             let _ = file.write_all(line.as_bytes());
-            let _ = file.sync_all();
         }
     }
 }

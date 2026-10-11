@@ -423,7 +423,6 @@ fn dlog(msg: &str) {
             .open(path)
         {
             let _ = file.write_all(line.as_bytes());
-            let _ = file.sync_all();
         }
     }
 }
