@@ -83,27 +83,29 @@ jobs:
           cargo build --verbose --examples --tests
           cargo build --verbose --examples --tests --features async_io
           cargo build --verbose --examples --tests --features async_tokio
+      - name: macOS unit tests (TAP detach probe)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: |
+          cargo test --lib --features async_tokio select_io
+          cargo test --lib --features async_io select_io
+      # The privileged steps have their own step timeouts (macOS runners have
+      # no `timeout` binary), so a stall fails the step with its log kept
+      # instead of the runner cancelling the whole job.
+      - name: macOS privileged TAP/utun tests (async_tokio)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 5
+        run: |
+          cargo test --test macos_tap_detach --features async_tokio --no-run
+          sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features async_tokio -- --ignored --nocapture --test-threads=1
+      - name: macOS privileged TAP/utun tests (async_io)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 5
+        run: |
+          cargo test --test macos_tap_detach --features async_io --no-run
+          sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features async_io -- --ignored --nocapture --test-threads=1
       - name: Abort on error
         if: ${{ failure() }}
         run: echo "Some of jobs failed" && false
-
-  test_macos_tap_detach:
-    runs-on: macos-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        feature: [ async_tokio, async_io ]
-
-    steps:
-      - uses: actions/checkout@v7
-      - name: Unit tests (poll/probe boundedness)
-        run: cargo test --lib --features ${{ matrix.feature }} select_io
-      - name: Privileged feth/utun regression tests
-        timeout-minutes: 5
-        run: |
-          cargo test --test macos_tap_detach --features ${{ matrix.feature }} --no-run
-          sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features ${{ matrix.feature }} -- --ignored --nocapture --test-threads=1
 
   build_n_test_freebsd:
     runs-on: ubuntu-latest
