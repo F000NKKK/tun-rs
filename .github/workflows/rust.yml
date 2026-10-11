@@ -98,6 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Privileged feth/utun regression tests
+        timeout-minutes: 5
         run: |
           cargo test --test macos_tap_detach --features ${{ matrix.feature }} --no-run
           sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features ${{ matrix.feature }} -- --ignored --nocapture --test-threads=1
