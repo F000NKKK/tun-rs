@@ -22,7 +22,7 @@
 
 use futures::executor::block_on;
 use futures::FutureExt;
-use std::io;
+use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::process::{Command, Stdio};
@@ -113,8 +113,8 @@ fn dump_threads(name: &str) {
 /// a watchdog ends the process if even that stalls. Tests are serialized so
 /// CPU and timing measurements are not disturbed by neighbors.
 fn run(name: &'static str, body: impl FnOnce(Arc<Pair>) + Send + 'static) {
-    let _serial = serial();
-    let pair = Arc::new(Pair::new());
+    // The watchdog starts first so even a stall in the lock, in interface
+    // creation or in cleanup ends the process with the test name logged.
     let finished = Arc::new(AtomicBool::new(false));
     {
         let finished = finished.clone();
@@ -127,9 +127,14 @@ fn run(name: &'static str, body: impl FnOnce(Arc<Pair>) + Send + 'static) {
                 thread::sleep(Duration::from_millis(200));
             }
             eprintln!("watchdog: {name} stalled past {WATCHDOG:?}; exiting");
-            std::process::exit(2);
+            let _ = io::stderr().flush();
+            // `_exit` skips exit handlers, which could themselves block on
+            // the stalled threads.
+            unsafe { libc::_exit(2) };
         });
     }
+    let _serial = serial();
+    let pair = Arc::new(Pair::new());
     let (tx, rx) = mpsc::channel();
     {
         let pair = pair.clone();
@@ -266,7 +271,10 @@ fn guarded<T: Send + 'static>(ctx: &str, f: impl FnOnce() -> T + Send + 'static)
     });
     match rx.recv_timeout(HANG_GUARD) {
         Ok(v) => v,
-        Err(_) => panic!("{ctx}: did not finish within {HANG_GUARD:?}"),
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("{ctx}: did not finish within {HANG_GUARD:?}")
+        }
+        Err(RecvTimeoutError::Disconnected) => panic!("{ctx}: the helper thread panicked"),
     }
 }
 
