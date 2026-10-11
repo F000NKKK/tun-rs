@@ -89,15 +89,20 @@ jobs:
 
   test_macos_tap_detach:
     runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [ async_tokio, async_io ]
 
     steps:
       - uses: actions/checkout@v7
       - name: Unit tests (poll/probe boundedness)
-        run: cargo test --lib --features async_tokio select_io
-      - name: Privileged feth destroy wake-up test
+        run: cargo test --lib --features ${{ matrix.feature }} select_io
+      - name: Privileged feth/utun regression tests
         run: |
-          cargo test --test macos_tap_detach --features async_tokio --no-run
-          sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features async_tokio -- --ignored --nocapture
+          cargo test --test macos_tap_detach --features ${{ matrix.feature }} --no-run
+          sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features ${{ matrix.feature }} -- --ignored --nocapture --test-threads=1
 
   build_n_test_freebsd:
     runs-on: ubuntu-latest

@@ -494,10 +494,12 @@ mod tests {
         EventFd::new().unwrap()
     }
 
-    /// An idle wait must wake only about four times per second (the probe
-    /// interval), never spin.
+    /// An idle wait must probe at the finite interval, never spin. A loaded
+    /// runner can only make the gaps longer, so the check is a lower bound on
+    /// each gap with no upper bound on wall time.
     #[test]
     fn idle_wait_probes_at_bounded_rate() {
+        const PROBES: u32 = 5;
         let pipe = idle_pipe();
         let mut fds = [libc::pollfd {
             fd: pipe.as_event_fd(),
@@ -505,17 +507,46 @@ mod tests {
             revents: 0,
         }];
         let mut probes = 0u32;
-        let start = Instant::now();
-        let mut elapsed = Duration::ZERO;
+        let mut gaps = Vec::new();
+        let mut last = Instant::now();
         let result = poll_with_probe(&mut fds, DETACH_PROBE_INTERVAL, || {
             probes += 1;
-            elapsed = start.elapsed();
-            elapsed >= Duration::from_secs(3)
+            let now = Instant::now();
+            gaps.push(now.duration_since(last));
+            last = now;
+            probes >= PROBES
         })
         .unwrap();
         assert_eq!(result, 0);
-        // 3 s at 250 ms is 12 probes; allow slack but reject any busy loop.
-        assert!((6..=13).contains(&probes), "probes = {probes}");
+        assert_eq!(gaps.len(), PROBES as usize);
+        // A spinning loop probes back to back; a real wait takes about the
+        // interval, so half of it separates the two with wide margin.
+        for (i, gap) in gaps.iter().enumerate() {
+            assert!(
+                *gap >= DETACH_PROBE_INTERVAL / 2,
+                "probe {i} came after only {gap:?}"
+            );
+        }
+    }
+
+    /// Without a detach the probe keeps running: the loop only ends on a
+    /// detach or readiness, so it cannot return early on its own.
+    #[test]
+    fn probe_runs_until_detached() {
+        let pipe = idle_pipe();
+        let mut fds = [libc::pollfd {
+            fd: pipe.as_event_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let mut probes = 0u32;
+        let result = poll_with_probe(&mut fds, Duration::from_millis(20), || {
+            probes += 1;
+            probes == 3
+        })
+        .unwrap();
+        assert_eq!(result, 0);
+        assert_eq!(probes, 3);
     }
 
     #[test]
