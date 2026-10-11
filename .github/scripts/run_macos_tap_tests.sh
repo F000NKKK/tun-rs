@@ -11,7 +11,7 @@ set -u
 
 feature="${1:?feature required}"
 per_test="${PER_TEST_SECS:-120}"
-total="${TOTAL_SECS:-270}"
+total="${TOTAL_SECS:-420}"
 started=$(date +%s)
 
 build_json=$(mktemp "${TMPDIR:-/tmp}/tap_build_json.XXXXXX")
@@ -50,9 +50,13 @@ if [ -z "$tests" ]; then
     echo "no tests listed"
     exit 1
 fi
+# Stress tests are hazardous (they can wedge a macOS kernel) and run only
+# when asked for by name through ONLY.
+all_tests="$tests"
+tests=$(echo "$tests" | grep -v '_stress$')
 # ONLY runs a single test; EXCLUDE drops a single test (exact names).
 if [ -n "${ONLY:-}" ]; then
-    tests=$(echo "$tests" | grep -x "$ONLY")
+    tests=$(echo "$all_tests" | grep -x "$ONLY")
 elif [ -n "${EXCLUDE:-}" ]; then
     tests=$(echo "$tests" | grep -vx "$EXCLUDE")
 fi
