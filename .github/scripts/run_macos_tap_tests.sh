@@ -116,13 +116,20 @@ for t in $tests; do
     diag_env=()
     [ -n "${TAP_DIAG:-}" ] && diag_env+=("TAP_DIAG=$TAP_DIAG")
     [ -n "${TAP_DIAG_MODE:-}" ] && diag_env+=("TAP_DIAG_MODE=$TAP_DIAG_MODE")
+    [ -n "${TAP_DIAG_FILE:-}" ] && diag_env+=("TAP_DIAG_FILE=$TAP_DIAG_FILE")
     sudo env "TAP_DETACH_PARKED=${TAP_DETACH_PARKED:-}" ${diag_env[@]+"${diag_env[@]}"} "$bin" --ignored --exact "$t" --nocapture --test-threads=1 >"$log" 2>&1 &
     pid=$!
+    # Stream the log live (the file is the test's stdout/stderr), so a hung
+    # step still shows everything written before the hang. tail only reads
+    # the file, so a wedged test cannot block it.
+    tail -n +1 -F "$log" 2>/dev/null &
+    tail_pid=$!
     waited=0
     while is_running "$pid"; do
         if [ "$waited" -ge "$per_test" ]; then
             echo "=== $t: HUNG after ${per_test}s"
-            cat "$log"
+            sleep 1
+            kill "$tail_pid" 2>/dev/null
             dump_state
             sudo pkill -9 -f "$bin"
             sudo kill -9 "$pid" 2>/dev/null
@@ -138,7 +145,9 @@ for t in $tests; do
     done
     wait "$pid"
     rc=$?
-    cat "$log"
+    # Let tail drain the last lines, then stop it; no second cat of the log.
+    sleep 2
+    kill "$tail_pid" 2>/dev/null
     if [ "$rc" -ne 0 ]; then
         echo "=== $t: FAILED (exit $rc)"
         failed=$((failed + 1))

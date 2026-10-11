@@ -95,48 +95,66 @@ jobs:
       # The hazardous `*_stress` test is skipped by the script (see its
       # comment); only the bounded tests run here.
       # Diagnostic branch: only the parked-reader diagnostic runs.
-      - name: macOS diag parked readers (3)
+      - name: macOS diag log file
         if: ${{ !cancelled() && runner.os == 'macOS' }}
-        timeout-minutes: 3
+        run: echo "TAP_DIAG_FILE=${{ runner.temp }}/tap_diag.log" >> "$GITHUB_ENV"
+      - name: diag N=3 run 1/3
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 2
         env:
           ONLY: diag_parked_readers
           TAP_DETACH_PARKED: 3
           TAP_DIAG: 1
         run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
-      - name: macOS diag parked readers (4)
+      - name: diag N=3 run 2/3
         if: ${{ !cancelled() && runner.os == 'macOS' }}
-        timeout-minutes: 3
+        timeout-minutes: 2
+        env:
+          ONLY: diag_parked_readers
+          TAP_DETACH_PARKED: 3
+          TAP_DIAG: 1
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: diag N=3 run 3/3
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 2
+        env:
+          ONLY: diag_parked_readers
+          TAP_DETACH_PARKED: 3
+          TAP_DIAG: 1
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: diag N=4
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 2
         env:
           ONLY: diag_parked_readers
           TAP_DETACH_PARKED: 4
           TAP_DIAG: 1
         run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
-      - name: macOS diag parked readers (2)
+      - name: diag N=2
         if: ${{ !cancelled() && runner.os == 'macOS' }}
-        timeout-minutes: 3
+        timeout-minutes: 2
         env:
           ONLY: diag_parked_readers
           TAP_DETACH_PARKED: 2
           TAP_DIAG: 1
         run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
-      - name: macOS diag parked readers (16)
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
-        timeout-minutes: 3
-        env:
-          ONLY: diag_parked_readers
-          TAP_DETACH_PARKED: 16
-          TAP_DIAG: 1
-        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
-      # The stress test that failed before, now with the per-thread log, last
-      # because it can wedge the runner.
-      - name: macOS stress with log (4)
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
-        timeout-minutes: 3
-        env:
-          ONLY: many_parked_recvs_all_wake_stress
-          TAP_DETACH_PARKED: 4
-          TAP_DIAG: 1
-        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: macOS diag log dump
+        if: ${{ always() }}
+        run: |
+          if [ -n "${TAP_DIAG_FILE:-}" ] && [ -f "$TAP_DIAG_FILE" ]; then
+            echo "---- $TAP_DIAG_FILE (last 400 lines) ----"
+            tail -n 400 "$TAP_DIAG_FILE"
+          else
+            echo "no diag file"
+          fi
+          echo "---- process table ----"
+          (ps -axo pid,ppid,state,wchan,command | grep -E 'macos_tap_detach|ifconfig' | grep -v grep) &
+          pid=$!
+          for _ in $(seq 20); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          kill -9 "$pid" 2>/dev/null || true
       - name: Abort on error
         if: ${{ failure() }}
         run: echo "Some of jobs failed" && false
