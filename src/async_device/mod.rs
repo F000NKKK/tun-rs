@@ -172,7 +172,7 @@ pub(crate) mod unix;
 #[cfg(all(unix, not(target_os = "macos")))]
 pub use unix::AsyncDevice;
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::AsyncDevice;
 #[cfg(windows)]

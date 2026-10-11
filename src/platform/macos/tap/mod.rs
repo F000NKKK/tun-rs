@@ -290,8 +290,16 @@ impl Tap {
         if self.peer_ifindex == 0 {
             return false;
         }
+        use crate::async_device::macos::select_io::{diag, diag_on};
+        let on = diag_on();
+        if on {
+            diag(format_args!("if_nametoindex start"));
+        }
         // SAFETY: `peer_cname` is a valid NUL-terminated string.
         let current = unsafe { libc::if_nametoindex(self.peer_cname.as_ptr()) };
+        if on {
+            diag(format_args!("if_nametoindex returned {current}"));
+        }
         current != self.peer_ifindex
     }
     /// Diagnostic: `(current if_nametoindex, index recorded at bind)`.

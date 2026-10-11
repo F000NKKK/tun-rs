@@ -411,7 +411,21 @@ fn unix_ms() -> u128 {
 
 /// Diagnostic: stderr line stamped with unix milliseconds.
 fn dlog(msg: &str) {
-    eprintln!("[test-diag unix_ms={}] {msg}", unix_ms());
+    use std::io::Write;
+    let line = format!("[test-diag unix_ms={}] {msg}\n", unix_ms());
+    unsafe {
+        libc::write(2, line.as_ptr().cast(), line.len());
+    }
+    if let Some(path) = std::env::var_os("TAP_DIAG_FILE") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.sync_all();
+        }
+    }
 }
 
 /// Diagnostic: `if_nametoindex` of `name` (`0` when it does not exist).

@@ -112,8 +112,12 @@ impl NonBlockingDevice {
             "wait enter events={device_events:#x} cancel={}",
             cancel_event.is_some()
         ));
+        let begin = std::time::Instant::now();
         let r = self.wait_impl(device_events, cancel_event);
-        diag(format_args!("wait return {r:?}"));
+        diag(format_args!(
+            "wait return {r:?} total_wait={:.3}s",
+            begin.elapsed().as_secs_f64()
+        ));
         r
     }
 
@@ -187,14 +191,16 @@ impl NonBlockingDevice {
 }
 
 /// Diagnostic: `true` when the `TAP_DIAG` environment variable is set.
-fn diag_on() -> bool {
+pub(crate) fn diag_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("TAP_DIAG").is_some())
 }
 
 /// Diagnostic: writes one line to stderr (fd 2) with unix milliseconds,
-/// seconds since the first diagnostic line, and the thread id.
-fn diag(args: std::fmt::Arguments<'_>) {
+/// seconds since the first diagnostic line, and the thread id. When
+/// `TAP_DIAG_FILE` names a file, the line is also appended there and synced
+/// so it survives a wedged process or runner.
+pub(crate) fn diag(args: std::fmt::Arguments<'_>) {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let start = *START.get_or_init(std::time::Instant::now);
     let unix_ms = std::time::SystemTime::now()
@@ -208,6 +214,17 @@ fn diag(args: std::fmt::Arguments<'_>) {
     );
     unsafe {
         libc::write(2, line.as_ptr().cast(), line.len());
+    }
+    if let Some(path) = std::env::var_os("TAP_DIAG_FILE") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.sync_all();
+        }
     }
 }
 
