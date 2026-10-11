@@ -91,13 +91,62 @@ jobs:
       # The privileged steps have their own step timeouts (macOS runners have
       # no `timeout` binary), so a stall fails the step with its log kept
       # instead of the runner cancelling the whole job.
+      # Everything except the many-reader test first, so its logs survive if
+      # the riskiest step freezes the runner. That test then runs with a
+      # growing reader count (2, 4, 16) to bisect a kernel-level trigger.
       - name: macOS privileged TAP/utun tests (async_tokio)
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         timeout-minutes: 5
+        env:
+          EXCLUDE: many_parked_recvs_all_wake
         run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
       - name: macOS privileged TAP/utun tests (async_io)
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         timeout-minutes: 5
+        env:
+          EXCLUDE: many_parked_recvs_all_wake
+        run: bash .github/scripts/run_macos_tap_tests.sh async_io
+      - name: macOS parked readers x2 (async_tokio)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: many_parked_recvs_all_wake
+          TAP_DETACH_PARKED: 2
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: macOS parked readers x2 (async_io)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: many_parked_recvs_all_wake
+          TAP_DETACH_PARKED: 2
+        run: bash .github/scripts/run_macos_tap_tests.sh async_io
+      - name: macOS parked readers x4 (async_tokio)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: many_parked_recvs_all_wake
+          TAP_DETACH_PARKED: 4
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: macOS parked readers x4 (async_io)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: many_parked_recvs_all_wake
+          TAP_DETACH_PARKED: 4
+        run: bash .github/scripts/run_macos_tap_tests.sh async_io
+      - name: macOS parked readers x16 (async_tokio)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: many_parked_recvs_all_wake
+          TAP_DETACH_PARKED: 16
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: macOS parked readers x16 (async_io)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: many_parked_recvs_all_wake
+          TAP_DETACH_PARKED: 16
         run: bash .github/scripts/run_macos_tap_tests.sh async_io
       - name: Abort on error
         if: ${{ failure() }}

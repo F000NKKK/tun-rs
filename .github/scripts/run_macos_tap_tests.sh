@@ -50,6 +50,16 @@ if [ -z "$tests" ]; then
     echo "no tests listed"
     exit 1
 fi
+# ONLY runs a single test; EXCLUDE drops a single test (exact names).
+if [ -n "${ONLY:-}" ]; then
+    tests=$(echo "$tests" | grep -x "$ONLY")
+elif [ -n "${EXCLUDE:-}" ]; then
+    tests=$(echo "$tests" | grep -vx "$EXCLUDE")
+fi
+if [ -z "$tests" ]; then
+    echo "no tests selected (ONLY='${ONLY:-}' EXCLUDE='${EXCLUDE:-}')"
+    exit 1
+fi
 
 # Runs a command for at most $1 seconds; never waits on a stuck process.
 bounded() {
@@ -99,7 +109,7 @@ for t in $tests; do
     fi
     echo "=== $t"
     log=$(mktemp "${TMPDIR:-/tmp}/tap_test_log.XXXXXX")
-    sudo "$bin" --ignored --exact "$t" --nocapture --test-threads=1 >"$log" 2>&1 &
+    sudo env "TAP_DETACH_PARKED=${TAP_DETACH_PARKED:-}" "$bin" --ignored --exact "$t" --nocapture --test-threads=1 >"$log" 2>&1 &
     pid=$!
     waited=0
     while is_running "$pid"; do

@@ -168,6 +168,9 @@ struct Pair {
     idx: u32,
     dev: String,
     peer: String,
+    /// Set once the pair was destroyed, so the kernel is never asked to
+    /// destroy an interface that is still detaching from an earlier request.
+    destroyed: AtomicBool,
 }
 
 impl Pair {
@@ -179,13 +182,18 @@ impl Pair {
             idx,
             dev: format!("feth{base}"),
             peer: format!("feth{}", base + 1),
+            destroyed: AtomicBool::new(false),
         };
-        pair.destroy();
+        destroy(&pair.dev);
+        destroy(&pair.peer);
         pair
     }
 
-    /// Destroys both interfaces of the pair; safe to call repeatedly.
+    /// Destroys both interfaces of the pair; only the first call acts.
     fn destroy(&self) {
+        if self.destroyed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         destroy(&self.dev);
         destroy(&self.peer);
     }
@@ -367,7 +375,13 @@ fn recv_after_destroy_before_first_recv_errors_immediately() {
 fn many_parked_recvs_all_wake() {
     run("many_parked_recvs_all_wake", |pair| {
         let dev = pair.build();
-        let readers: Vec<_> = (0..16).map(|_| spawn_recv(&dev)).collect();
+        // The reader count is tunable so CI can bisect a kernel-level trigger.
+        let parked: usize = std::env::var("TAP_DETACH_PARKED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16);
+        let readers: Vec<_> = (0..parked).map(|_| spawn_recv(&dev)).collect();
         thread::sleep(Duration::from_millis(500));
         pair.destroy();
         // One shared deadline; report how many readers woke on failure.
