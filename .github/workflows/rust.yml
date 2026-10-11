@@ -87,6 +87,18 @@ jobs:
         if: ${{ failure() }}
         run: echo "Some of jobs failed" && false
 
+  test_macos_tap_detach:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit tests (poll/probe boundedness)
+        run: cargo test --lib --features async_tokio select_io
+      - name: Privileged feth destroy wake-up test
+        run: |
+          cargo test --test macos_tap_detach --features async_tokio --no-run
+          sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features async_tokio -- --ignored --nocapture
+
   build_n_test_freebsd:
     runs-on: ubuntu-latest
 
