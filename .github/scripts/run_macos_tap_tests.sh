@@ -14,16 +14,35 @@ per_test="${PER_TEST_SECS:-120}"
 total="${TOTAL_SECS:-270}"
 started=$(date +%s)
 
-build_out=$(cargo test --test macos_tap_detach --features "$feature" --no-run 2>&1)
-status=$?
-echo "$build_out"
-if [ "$status" -ne 0 ]; then
+build_json=$(mktemp "${TMPDIR:-/tmp}/tap_build_json.XXXXXX")
+build_err=$(mktemp "${TMPDIR:-/tmp}/tap_build_err.XXXXXX")
+if ! cargo test --test macos_tap_detach --features "$feature" --no-run \
+    --message-format=json >"$build_json" 2>"$build_err"; then
     echo "build failed"
+    cat "$build_err"
     exit 1
 fi
-bin=$(echo "$build_out" | sed -n 's/.*Executable .*(\(.*\))$/\1/p' | tail -1)
-if [ -z "$bin" ] || [ ! -x "$bin" ]; then
-    echo "cannot locate the test binary"
+cat "$build_err"
+
+# The test executable is reported in a compiler-artifact message; read it
+# from the JSON instead of scraping cargo's colored human-readable output.
+if command -v jq >/dev/null 2>&1; then
+    bin=$(jq -r 'select(.reason == "compiler-artifact"
+            and .target.name == "macos_tap_detach"
+            and .executable != null) | .executable' "$build_json" | tail -1)
+else
+    bin=$(grep '"name":"macos_tap_detach"' "$build_json" | grep '"executable":"' \
+        | sed 's/.*"executable":"\([^"]*\)".*/\1/' | tail -1)
+fi
+case "$bin" in
+    "" | null) ;;
+    /*) ;;
+    *) bin="$PWD/$bin" ;;
+esac
+echo "test binary: ${bin:-<none>}"
+if [ -z "$bin" ] || [ "$bin" = null ] || [ ! -x "$bin" ]; then
+    echo "cannot locate the test binary; raw build output follows"
+    cat "$build_json"
     exit 1
 fi
 tests=$("$bin" --ignored --list 2>/dev/null | sed -n 's/: test$//p')
@@ -79,7 +98,7 @@ for t in $tests; do
         continue
     fi
     echo "=== $t"
-    log=$(mktemp)
+    log=$(mktemp "${TMPDIR:-/tmp}/tap_test_log.XXXXXX")
     sudo "$bin" --ignored --exact "$t" --nocapture --test-threads=1 >"$log" 2>&1 &
     pid=$!
     waited=0
