@@ -253,35 +253,13 @@ impl Tap {
     ///
     /// XNU raises no poll event when the interface disappears, so async
     /// waiters probe this periodically. The probe never touches the BPF
-    /// descriptor. It reports detached when either
-    ///
-    /// * `SIOCGIFFLAGS` on a throwaway datagram socket fails with `ENXIO`.
-    ///   The kernel resolves interface names for ioctls only while the
-    ///   interface is attached, so this fires as soon as the destroy begins,
-    ///   even while the interface still lingers in the name table because
-    ///   open descriptors keep it referenced; or
-    /// * `if_nametoindex` no longer returns the index recorded when the
-    ///   descriptor was bound (the interface is gone, or its name was reused).
-    ///
-    /// Any other outcome, including failure to open the probe socket, counts
-    /// as "still attached" so a transient error never ends a wait early. If no
-    /// index could be recorded, only the first check applies.
+    /// descriptor: it resolves the interface name with `if_nametoindex` and
+    /// compares the result with the index recorded when the descriptor was
+    /// bound. A missing interface (index `0`) or a different index (the name
+    /// was reused by a new interface) means detached. If no index could be
+    /// recorded the device is never reported as detached.
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     pub(crate) fn is_detached(&self) -> bool {
-        if let Ok(mut ifr) = new_ifreq_str(&self.peer_feth.name) {
-            let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-            if sock >= 0 {
-                // SAFETY: `ifr` is a valid, initialized `ifreq`; SIOCGIFFLAGS
-                // only writes the flags field of it.
-                let rs = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut ifr) };
-                let errno = io::Error::last_os_error().raw_os_error();
-                // SAFETY: `sock` was opened above and is closed exactly once.
-                unsafe { libc::close(sock) };
-                if rs == -1 && errno == Some(libc::ENXIO) {
-                    return true;
-                }
-            }
-        }
         if self.peer_ifindex == 0 {
             return false;
         }
