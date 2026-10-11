@@ -397,8 +397,8 @@ fn many_parked_recvs_all_wake_stress() {
 
 /// Parks `parked` recvs on one TAP device, destroys its feth pair and checks
 /// that every reader wakes with `ENXIO`.
-fn parked_recvs_all_wake(name: &str, parked: usize) {
-    run(name, |pair| {
+fn parked_recvs_all_wake(name: &'static str, parked: usize) {
+    run(name, move |pair| {
         let dev = pair.build();
         let readers: Vec<_> = (0..parked).map(|_| spawn_recv(&dev)).collect();
         thread::sleep(Duration::from_millis(500));
