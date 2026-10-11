@@ -82,12 +82,23 @@ impl NonBlockingDevice {
                 revents: 0,
             });
         }
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // A destroyed feth pair raises no poll event on XNU, so TAP waits use
+        // a finite timeout and probe whether the BPF fd is still attached.
+        let result = if self.device.needs_detach_probe() {
+            poll_with_probe(&mut fds, DETACH_PROBE_INTERVAL, || {
+                self.device.is_detached()
+            })?
+        } else {
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            result
+        };
         if result == 0 {
-            return Err(io::Error::from(io::ErrorKind::TimedOut));
+            // Detached: report readiness so the next read/write surfaces the
+            // kernel's ENXIO instead of hanging.
+            return Ok(());
         }
         if fds[1].revents & libc::POLLIN != 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"));
@@ -99,6 +110,37 @@ impl NonBlockingDevice {
             return Ok(());
         }
         Err(io::Error::other("fd error"))
+    }
+}
+
+/// Interval between detach probes while a TAP wait is idle (about 4 wakeups
+/// per second, so idle waits never turn into a busy loop).
+const DETACH_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Polls `fds` with a finite timeout, calling `is_detached` after every idle
+/// timeout. Returns the number of ready descriptors, or `0` when
+/// `is_detached` reported `true`. `EINTR` is retried.
+fn poll_with_probe(
+    fds: &mut [libc::pollfd],
+    interval: Duration,
+    mut is_detached: impl FnMut() -> bool,
+) -> io::Result<libc::c_int> {
+    let timeout_ms = interval.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+    loop {
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if result > 0 {
+            return Ok(result);
+        }
+        if is_detached() {
+            return Ok(0);
+        }
     }
 }
 
@@ -440,5 +482,55 @@ impl Drop for CancelWaitGuard<'_> {
                 .exit_event_handle
                 .wait_timeout(Duration::from_millis(1))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn idle_pipe() -> EventFd {
+        EventFd::new().unwrap()
+    }
+
+    /// An idle wait must wake only about four times per second (the probe
+    /// interval), never spin.
+    #[test]
+    fn idle_wait_probes_at_bounded_rate() {
+        let pipe = idle_pipe();
+        let mut fds = [libc::pollfd {
+            fd: pipe.as_event_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let mut probes = 0u32;
+        let start = Instant::now();
+        let mut elapsed = Duration::ZERO;
+        let result = poll_with_probe(&mut fds, DETACH_PROBE_INTERVAL, || {
+            probes += 1;
+            elapsed = start.elapsed();
+            elapsed >= Duration::from_secs(3)
+        })
+        .unwrap();
+        assert_eq!(result, 0);
+        // 3 s at 250 ms is 12 probes; allow slack but reject any busy loop.
+        assert!((6..=13).contains(&probes), "probes = {probes}");
+    }
+
+    #[test]
+    fn readiness_wins_over_probe() {
+        let pipe = idle_pipe();
+        pipe.wake().unwrap();
+        let mut fds = [libc::pollfd {
+            fd: pipe.as_event_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let result = poll_with_probe(&mut fds, DETACH_PROBE_INTERVAL, || {
+            panic!("probe must not run when an fd is ready")
+        })
+        .unwrap();
+        assert_eq!(result, 1);
     }
 }

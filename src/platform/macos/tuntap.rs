@@ -155,6 +155,19 @@ impl TunTap {
             TunTap::Tap(tap) => tap.set_nonblocking(nonblocking),
         }
     }
+    /// Always `false` for TUN (a destroyed utun already wakes `poll`).
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    pub(crate) fn is_detached(&self) -> bool {
+        match self {
+            TunTap::Tun(_) => false,
+            TunTap::Tap(tap) => tap.is_detached(),
+        }
+    }
+    /// Whether waits on this device need the periodic detach probe.
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    pub(crate) fn needs_detach_probe(&self) -> bool {
+        matches!(self, TunTap::Tap(_))
+    }
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     #[inline]
     pub(crate) fn writable_fd(&self) -> RawFd {

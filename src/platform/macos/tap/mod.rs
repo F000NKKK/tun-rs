@@ -227,6 +227,28 @@ impl Tap {
     pub(crate) fn writable_fd(&self) -> RawFd {
         self.s_ndrv_fd.as_raw_fd()
     }
+    /// Returns `true` once the BPF descriptor is no longer attached to its
+    /// feth interface (for example after the feth pair was destroyed).
+    ///
+    /// XNU raises no poll event when the interface disappears, so async
+    /// waiters probe this periodically. `BIOCGETIF` fails with `EINVAL` or
+    /// `ENXIO` on a detached descriptor; any other outcome is treated as
+    /// "still attached" so transient errors never end a wait early.
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    pub(crate) fn is_detached(&self) -> bool {
+        // SAFETY: `ifreq` is plain old data and zero is a valid bit pattern;
+        // BIOCGETIF writes at most `size_of::<ifreq>()` bytes into it.
+        let mut ifr: ifreq = unsafe { std::mem::zeroed() };
+        let rs = unsafe { libc::ioctl(self.s_bpf_fd.inner, libc::BIOCGETIF, &mut ifr) };
+        if rs == -1 {
+            matches!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENXIO)
+            )
+        } else {
+            false
+        }
+    }
     #[inline]
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.s_ndrv_fd.write(buf)

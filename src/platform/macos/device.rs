@@ -52,6 +52,18 @@ impl DeviceImpl {
     pub(crate) fn writable_fd(&self) -> std::os::fd::RawFd {
         self.tun.writable_fd()
     }
+    /// `true` when the device needs periodic detach probing (TAP only).
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    #[inline]
+    pub(crate) fn needs_detach_probe(&self) -> bool {
+        self.tun.needs_detach_probe()
+    }
+    /// `true` once the kernel interface backing the device is gone.
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    #[inline]
+    pub(crate) fn is_detached(&self) -> bool {
+        self.tun.is_detached()
+    }
     /// Prepare a new request.
     fn request(&self) -> io::Result<libc::ifreq> {
         self.tun.request()
