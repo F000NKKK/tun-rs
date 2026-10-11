@@ -119,6 +119,24 @@ jobs:
           TAP_DETACH_PARKED: 2
           TAP_DIAG: 1
         run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: macOS diag parked readers (16)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: diag_parked_readers
+          TAP_DETACH_PARKED: 16
+          TAP_DIAG: 1
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      # The stress test that failed before, now with the per-thread log, last
+      # because it can wedge the runner.
+      - name: macOS stress with log (4)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: many_parked_recvs_all_wake_stress
+          TAP_DETACH_PARKED: 4
+          TAP_DIAG: 1
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
       - name: Abort on error
         if: ${{ failure() }}
         run: echo "Some of jobs failed" && false
