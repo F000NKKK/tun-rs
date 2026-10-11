@@ -100,6 +100,7 @@ jobs:
       - name: Unit tests (poll/probe boundedness)
         run: cargo test --lib --features ${{ matrix.feature }} select_io
       - name: Privileged feth/utun regression tests
+        timeout-minutes: 5
         run: |
           cargo test --test macos_tap_detach --features ${{ matrix.feature }} --no-run
           sudo -E env "PATH=$PATH" cargo test --test macos_tap_detach --features ${{ matrix.feature }} -- --ignored --nocapture --test-threads=1

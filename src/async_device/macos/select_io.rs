@@ -109,6 +109,16 @@ impl NonBlockingDevice {
         if fds[0].revents & device_events != 0 {
             return Ok(());
         }
+        // A detached TAP makes poll report POLLERR/POLLHUP/POLLNVAL at once.
+        // Report readiness so the next read or write surfaces the kernel's
+        // ENXIO instead of an error without an OS code.
+        let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+        if self.device.needs_detach_probe()
+            && fds[0].revents & error_events != 0
+            && self.device.is_detached()
+        {
+            return Ok(());
+        }
         Err(io::Error::other("fd error"))
     }
 }
