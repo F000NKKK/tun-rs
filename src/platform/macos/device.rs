@@ -59,6 +59,11 @@ impl DeviceImpl {
     pub(crate) fn needs_detach_probe(&self) -> bool {
         self.tun.needs_detach_probe()
     }
+    /// Diagnostic: `(current index, recorded index)` for a TAP.
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    pub(crate) fn diag_ifindex(&self) -> Option<(u32, u32)> {
+        self.tun.diag_ifindex()
+    }
     /// `true` once the kernel interface backing the device is gone.
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     #[inline]

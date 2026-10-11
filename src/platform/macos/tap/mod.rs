@@ -294,6 +294,13 @@ impl Tap {
         let current = unsafe { libc::if_nametoindex(self.peer_cname.as_ptr()) };
         current != self.peer_ifindex
     }
+    /// Diagnostic: `(current if_nametoindex, index recorded at bind)`.
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    pub(crate) fn diag_ifindex(&self) -> (u32, u32) {
+        // SAFETY: `peer_cname` is a valid NUL-terminated string.
+        let current = unsafe { libc::if_nametoindex(self.peer_cname.as_ptr()) };
+        (current, self.peer_ifindex)
+    }
     #[inline]
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.s_ndrv_fd.write(buf)

@@ -40,10 +40,23 @@ impl NonBlockingDevice {
 
     /// Runs the detach probe unless another waiter is already running it.
     fn probe_detached(&self) -> bool {
+        let on = diag_on();
         if self.probing.swap(true, Ordering::Acquire) {
+            if on {
+                diag(format_args!("probe skipped (another prober active)"));
+            }
             return false;
         }
+        if on {
+            diag(format_args!("probe start"));
+        }
         let detached = self.device.is_detached();
+        if on {
+            diag(format_args!(
+                "probe result is_detached={detached} (current,recorded)ifindex={:?}",
+                self.device.diag_ifindex()
+            ));
+        }
         self.probing.store(false, Ordering::Release);
         detached
     }
@@ -88,6 +101,24 @@ impl NonBlockingDevice {
     /// reported as ready so the next read or write surfaces the kernel's
     /// `ENXIO`. Shutdown yields `UnexpectedEof`.
     fn wait(
+        &self,
+        device_events: libc::c_short,
+        cancel_event: Option<libc::c_int>,
+    ) -> io::Result<()> {
+        if !(self.device.needs_detach_probe() && diag_on()) {
+            return self.wait_impl(device_events, cancel_event);
+        }
+        diag(format_args!(
+            "wait enter events={device_events:#x} cancel={}",
+            cancel_event.is_some()
+        ));
+        let r = self.wait_impl(device_events, cancel_event);
+        diag(format_args!("wait return {r:?}"));
+        r
+    }
+
+    /// The wait itself; see [`Self::wait`].
+    fn wait_impl(
         &self,
         device_events: libc::c_short,
         cancel_event: Option<libc::c_int>,
@@ -155,6 +186,31 @@ impl NonBlockingDevice {
     }
 }
 
+/// Diagnostic: `true` when the `TAP_DIAG` environment variable is set.
+fn diag_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TAP_DIAG").is_some())
+}
+
+/// Diagnostic: writes one line to stderr (fd 2) with unix milliseconds,
+/// seconds since the first diagnostic line, and the thread id.
+fn diag(args: std::fmt::Arguments<'_>) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!(
+        "[tap-diag unix_ms={unix_ms} +{:.3}s {:?}] {args}\n",
+        start.elapsed().as_secs_f64(),
+        std::thread::current().id()
+    );
+    unsafe {
+        libc::write(2, line.as_ptr().cast(), line.len());
+    }
+}
+
 /// Interval between detach probes while a TAP wait is idle (about 2 wakeups
 /// per second, so idle waits never turn into a busy loop and a detach is
 /// noticed well within a second).
@@ -169,8 +225,18 @@ fn poll_with_probe(
     mut is_detached: impl FnMut() -> bool,
 ) -> io::Result<libc::c_int> {
     let timeout_ms = interval.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+    let on = diag_on();
     loop {
+        if on {
+            diag(format_args!("poll enter timeout_ms={timeout_ms}"));
+        }
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if on {
+            let revents: Vec<_> = fds.iter().map(|f| f.revents).collect();
+            diag(format_args!(
+                "poll exit result={result} revents={revents:?}"
+            ));
+        }
         if result < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {

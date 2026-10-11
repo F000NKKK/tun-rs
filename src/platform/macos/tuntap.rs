@@ -163,6 +163,14 @@ impl TunTap {
             TunTap::Tap(tap) => tap.is_detached(),
         }
     }
+    /// Diagnostic: `(current index, recorded index)` for a TAP.
+    #[cfg(any(feature = "async_io", feature = "async_tokio"))]
+    pub(crate) fn diag_ifindex(&self) -> Option<(u32, u32)> {
+        match self {
+            TunTap::Tun(_) => None,
+            TunTap::Tap(tap) => Some(tap.diag_ifindex()),
+        }
+    }
     /// Whether waits on this device need the periodic detach probe.
     #[cfg(any(feature = "async_io", feature = "async_tokio"))]
     pub(crate) fn needs_detach_probe(&self) -> bool {
