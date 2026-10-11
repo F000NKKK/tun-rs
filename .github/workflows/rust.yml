@@ -94,14 +94,31 @@ jobs:
       # instead of the runner cancelling the whole job.
       # The hazardous `*_stress` test is skipped by the script (see its
       # comment); only the bounded tests run here.
-      - name: macOS privileged TAP/utun tests (async_tokio)
+      # Diagnostic branch: only the parked-reader diagnostic runs.
+      - name: macOS diag parked readers (3)
         if: ${{ !cancelled() && runner.os == 'macOS' }}
-        timeout-minutes: 8
+        timeout-minutes: 3
+        env:
+          ONLY: diag_parked_readers
+          TAP_DETACH_PARKED: 3
+          TAP_DIAG: 1
         run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
-      - name: macOS privileged TAP/utun tests (async_io)
+      - name: macOS diag parked readers (4)
         if: ${{ !cancelled() && runner.os == 'macOS' }}
-        timeout-minutes: 8
-        run: bash .github/scripts/run_macos_tap_tests.sh async_io
+        timeout-minutes: 3
+        env:
+          ONLY: diag_parked_readers
+          TAP_DETACH_PARKED: 4
+          TAP_DIAG: 1
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
+      - name: macOS diag parked readers (2)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        env:
+          ONLY: diag_parked_readers
+          TAP_DETACH_PARKED: 2
+          TAP_DIAG: 1
+        run: bash .github/scripts/run_macos_tap_tests.sh async_tokio
       - name: Abort on error
         if: ${{ failure() }}
         run: echo "Some of jobs failed" && false

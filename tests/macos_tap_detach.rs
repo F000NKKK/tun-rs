@@ -400,6 +400,128 @@ fn many_parked_recvs_all_wake_stress() {
     parked_recvs_all_wake("many_parked_recvs_all_wake_stress", parked);
 }
 
+/// Unix time in milliseconds, for correlating with the library's `tap-diag`
+/// lines.
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Diagnostic: stderr line stamped with unix milliseconds.
+fn dlog(msg: &str) {
+    eprintln!("[test-diag unix_ms={}] {msg}", unix_ms());
+}
+
+/// Diagnostic: `if_nametoindex` of `name` (`0` when it does not exist).
+fn nametoindex(name: &str) -> u32 {
+    let c = std::ffi::CString::new(name).unwrap();
+    unsafe { libc::if_nametoindex(c.as_ptr()) }
+}
+
+/// Diagnostic: the interface names listed by `ifconfig -l`.
+fn ifconfig_list() -> Vec<String> {
+    Command::new("ifconfig")
+        .arg("-l")
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Diagnostic, not a regression test: parks `TAP_DETACH_PARKED` (default 4)
+/// readers on one shared TAP device, destroys the feth pair, then for 8
+/// seconds logs once per second the interface indexes, the `ifconfig -l`
+/// listing and how many readers have returned. Ends the process with
+/// `_exit(0)` so thread teardown cannot wedge the test. Run with `TAP_DIAG=1`
+/// to also get the library's per-thread wait/probe lines. `TAP_DIAG_MODE` is
+/// `shared` (the only implemented mode: all readers use one device handle).
+#[ignore = "diagnostic: requires root, creates feth interfaces, exits the process"]
+#[test]
+fn diag_parked_readers() {
+    let parked: usize = std::env::var("TAP_DETACH_PARKED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4);
+    let mode = std::env::var("TAP_DIAG_MODE").unwrap_or_else(|_| "shared".into());
+    run("diag_parked_readers", move |pair| {
+        dlog(&format!("mode={mode} parked={parked}"));
+        if mode != "shared" {
+            dlog("only the shared mode is implemented; running shared");
+        }
+        let dev = pair.build();
+        let returned = Arc::new(AtomicU32::new(0));
+        let results = Arc::new(Mutex::new(Vec::<String>::new()));
+        for i in 0..parked {
+            let dev = dev.clone();
+            let returned = returned.clone();
+            let results = results.clone();
+            thread::spawn(move || {
+                let err = recv_until_err(&dev);
+                let line = format!("reader {i} returned {err:?} at unix_ms={}", unix_ms());
+                dlog(&line);
+                results.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                returned.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        thread::sleep(Duration::from_millis(500));
+        dlog(&format!(
+            "before destroy: {}={} {}={} listed={:?}",
+            pair.dev,
+            nametoindex(&pair.dev),
+            pair.peer,
+            nametoindex(&pair.peer),
+            ifconfig_list()
+                .into_iter()
+                .filter(|n| n.starts_with("feth"))
+                .collect::<Vec<_>>()
+        ));
+        dlog("destroy start");
+        pair.destroy();
+        dlog("destroy returned");
+        for sec in 1..=8 {
+            thread::sleep(Duration::from_secs(1));
+            // The sample runs on a helper so a stalled kernel call is visible
+            // as a missing line instead of freezing the loop.
+            let (dev_name, peer_name) = (pair.dev.clone(), pair.peer.clone());
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let listed = ifconfig_list();
+                let _ = tx.send((
+                    nametoindex(&dev_name),
+                    nametoindex(&peer_name),
+                    listed.contains(&dev_name),
+                    listed.contains(&peer_name),
+                ));
+            });
+            let woke = returned.load(Ordering::SeqCst);
+            match rx.recv_timeout(Duration::from_millis(800)) {
+                Ok((di, pi, dl, pl)) => dlog(&format!(
+                    "t+{sec}s: main {}: index={di} listed={dl}; peer {}: index={pi} listed={pl}; readers returned {woke}/{parked}",
+                    pair.dev, pair.peer
+                )),
+                Err(_) => dlog(&format!(
+                    "t+{sec}s: interface sample stalled; readers returned {woke}/{parked}"
+                )),
+            }
+        }
+        let woke = returned.load(Ordering::SeqCst);
+        dlog(&format!("RESULT: {woke} of {parked} readers returned"));
+        for line in results.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            dlog(line);
+        }
+        dlog("calling _exit(0)");
+        unsafe { libc::_exit(0) };
+    });
+}
+
 /// Parks `parked` recvs on one TAP device, destroys its feth pair and checks
 /// that every reader wakes with `ENXIO`.
 fn parked_recvs_all_wake(name: &'static str, parked: usize) {

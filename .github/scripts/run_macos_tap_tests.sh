@@ -113,7 +113,10 @@ for t in $tests; do
     fi
     echo "=== $t"
     log=$(mktemp "${TMPDIR:-/tmp}/tap_test_log.XXXXXX")
-    sudo env "TAP_DETACH_PARKED=${TAP_DETACH_PARKED:-}" "$bin" --ignored --exact "$t" --nocapture --test-threads=1 >"$log" 2>&1 &
+    diag_env=()
+    [ -n "${TAP_DIAG:-}" ] && diag_env+=("TAP_DIAG=$TAP_DIAG")
+    [ -n "${TAP_DIAG_MODE:-}" ] && diag_env+=("TAP_DIAG_MODE=$TAP_DIAG_MODE")
+    sudo env "TAP_DETACH_PARKED=${TAP_DETACH_PARKED:-}" ${diag_env[@]+"${diag_env[@]}"} "$bin" --ignored --exact "$t" --nocapture --test-threads=1 >"$log" 2>&1 &
     pid=$!
     waited=0
     while is_running "$pid"; do
